@@ -162,6 +162,9 @@ fn main() {
         .map_err(|v| v.to_string())
         .unwrap();
 
+        // `mut` is only used when the metal/vulkan cfg blocks below reassign `bindings`;
+        // with neither feature enabled those blocks compile out, so allow the otherwise-unused mut.
+        #[allow(unused_mut)]
         let mut bindings = bindgen::Builder::default()
             .rust_edition(bindgen::RustEdition::Edition2021)
             .rust_target(package_msrv)

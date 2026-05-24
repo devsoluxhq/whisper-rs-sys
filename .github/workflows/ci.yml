@@ -9,8 +9,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Compile + run the build script (CMake build of whisper.cpp + bindgen) across
-  # the configurations we ship: Linux default, Linux OpenMP, and macOS Metal.
+  # Compile + run the build script (CMake build of whisper.cpp + bindgen) across the
+  # configurations we ship. Every target generates its own bindings with bindgen — the
+  # checked-in src/bindings.rs is glibc-specific and is NOT portable to Windows/macOS.
   check:
     name: cargo check (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -27,6 +28,9 @@ jobs:
           - name: macos-metal
             os: macos-latest
             features: "--features metal"
+          - name: windows-default
+            os: windows-latest
+            features: ""
     steps:
       - uses: actions/checkout@v6
 
@@ -40,6 +44,18 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install cmake
 
+      # Windows runners ship CMake + MSVC but not a libclang that bindgen can reliably find,
+      # so install a pinned LLVM and point bindgen at it.
+      - name: Install LLVM (Windows, for bindgen)
+        if: runner.os == 'Windows'
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18.1.8"
+
+      - name: Point bindgen at libclang (Windows)
+        if: runner.os == 'Windows'
+        run: echo "LIBCLANG_PATH=$env:LLVM_PATH\bin" >> $env:GITHUB_ENV
+
       # MSRV is pinned to 1.88.0 in Cargo.toml; `stable` satisfies that floor.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -49,26 +65,20 @@ jobs:
       - name: cargo check
         run: cargo check --locked ${{ matrix.features }}
 
-  # Prebuilt-bindings path (no bindgen / libclang). Also exercises the MSVC build path on Windows,
-  # where build.rs has dedicated static-CRT handling.
+  # Prebuilt-bindings fast path (no bindgen / libclang). Linux-only: the checked-in
+  # src/bindings.rs was generated against glibc and is not valid on other platforms.
   check-no-bindgen:
-    name: cargo check, prebuilt bindings (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+    name: cargo check (prebuilt bindings, linux)
+    runs-on: ubuntu-latest
     env:
       WHISPER_DONT_GENERATE_BINDINGS: "1"
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install build dependencies (Linux)
-        if: runner.os == 'Linux'
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake
-      # Windows runners ship CMake and MSVC; no extra install needed.
 
       - uses: dtolnay/rust-toolchain@stable
 
