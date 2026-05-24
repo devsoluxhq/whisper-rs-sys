@@ -31,6 +31,7 @@ include = [
     "src/*.rs",
     "build.rs",
     "wrapper.h",
+    "README.md",
 ]
 autolib = false
 autobins = false
@@ -39,9 +40,9 @@ autotests = false
 autobenches = false
 description = "Rust bindings for whisper.cpp (FFI bindings)"
 documentation = "https://docs.rs/whisper-rs-sys"
-readme = false
+readme = "README.md"
 license = "Unlicense"
-repository = "https://codeberg.org/tazz4843/whisper-rs"
+repository = "https://github.com/devsoluxhq/whisper-rs-sys"
 
 [features]
 coreml = []

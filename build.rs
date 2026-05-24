@@ -38,7 +38,7 @@ fn main() {
     {
         if let Ok(openblas_path) = env::var("OPENBLAS_PATH") {
             println!(
-                "cargo::rustc-link-search={}",
+                "cargo:rustc-link-search={}",
                 PathBuf::from(openblas_path).join("lib").display()
             );
         }
@@ -96,26 +96,54 @@ fn main() {
             println!("cargo:rustc-link-lib=gomp");
         } else if target.contains("apple") {
             println!("cargo:rustc-link-lib=omp");
-            println!("cargo:rustc-link-search=/opt/homebrew/opt/libomp/lib");
+            println!("cargo:rerun-if-env-changed=LIBOMP_PATH");
+            // libomp lives in different places across machines (Apple Silicon vs Intel Homebrew,
+            // MacPorts, custom installs). Honor an explicit LIBOMP_PATH, then `brew --prefix`,
+            // and only then fall back to the Apple Silicon Homebrew default.
+            let libomp_lib = if let Ok(path) = env::var("LIBOMP_PATH") {
+                PathBuf::from(path).join("lib")
+            } else if let Some(prefix) = brew_prefix("libomp") {
+                prefix.join("lib")
+            } else {
+                PathBuf::from("/opt/homebrew/opt/libomp/lib")
+            };
+            println!("cargo:rustc-link-search={}", libomp_lib.display());
         }
     }
 
     println!("cargo:rerun-if-changed=wrapper.h");
+    // Rerun (and refresh the OUT_DIR copy below) whenever the vendored sources change.
+    // Watching the whole tree covers both the CMake build inputs (.c/.cpp/CMake files) and
+    // the headers consumed by bindgen (whisper.h, ggml.h, ggml-metal.h, ggml-vulkan.h).
+    println!("cargo:rerun-if-changed=whisper.cpp");
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let whisper_root = out.join("whisper.cpp");
 
-    if !whisper_root.exists() {
-        std::fs::create_dir_all(&whisper_root).unwrap();
-        fs_extra::dir::copy("./whisper.cpp", &out, &Default::default()).unwrap_or_else(|e| {
+    // The CMake build compiles from this OUT_DIR copy, not the source tree, so a stale copy
+    // would silently build outdated sources. Refresh it on every build-script run (reruns are
+    // gated by the rerun-if-changed inputs above, so this only happens when something changed).
+    if whisper_root.exists() {
+        std::fs::remove_dir_all(&whisper_root).unwrap_or_else(|e| {
             panic!(
-                "Failed to copy whisper sources into {}: {}",
+                "Failed to clear stale whisper.cpp copy at {}: {}",
                 whisper_root.display(),
                 e
             )
         });
     }
+    std::fs::create_dir_all(&whisper_root).unwrap();
+    fs_extra::dir::copy("./whisper.cpp", &out, &Default::default()).unwrap_or_else(|e| {
+        panic!(
+            "Failed to copy whisper sources into {}: {}",
+            whisper_root.display(),
+            e
+        )
+    });
 
+    // This env var selects the bindings path (regenerate vs. use checked-in src/bindings.rs),
+    // so a change to it must trigger a rebuild.
+    println!("cargo:rerun-if-env-changed=WHISPER_DONT_GENERATE_BINDINGS");
     if env::var("WHISPER_DONT_GENERATE_BINDINGS").is_ok() {
         let _: u64 = std::fs::copy("src/bindings.rs", out.join("bindings.rs"))
             .expect("Failed to copy bindings.rs");
@@ -173,7 +201,9 @@ fn main() {
         }
     };
 
-    // stop if we're on docs.rs
+    // Stop before the native CMake build on docs.rs: it has no linker/GPU toolchain and only needs
+    // the generated bindings (produced above) to render docs. Track the var so toggling it rebuilds.
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
     if env::var("DOCS_RS").is_ok() {
         return;
     }
@@ -292,13 +322,17 @@ fn main() {
         config.define("CMAKE_C_FLAGS_RELWITHDEBINFO", "/MT /Zi /O2 /Ob1 /DNDEBUG");
     }
 
-    // Allow passing any WHISPER or CMAKE compile flags
+    // Allow passing any WHISPER or CMAKE compile flags. These override the defines set above
+    // (CMake honors the last -D for a given key), so they are an intentional escape hatch.
+    // Emit rerun-if-env-changed for each forwarded var so changing one triggers a rebuild
+    // instead of silently reusing a stale CMake configuration.
     for (key, value) in env::vars() {
         let is_whisper_flag =
             key.starts_with("WHISPER_") && key != "WHISPER_DONT_GENERATE_BINDINGS";
         let is_ggml_flag = key.starts_with("GGML_");
         let is_cmake_flag = key.starts_with("CMAKE_");
         if is_whisper_flag || is_ggml_flag || is_cmake_flag {
+            println!("cargo:rerun-if-env-changed={}", key);
             config.define(&key, &value);
         }
     }
@@ -331,6 +365,8 @@ fn main() {
         println!("cargo:rustc-link-lib=static=ggml-base");
         println!("cargo:rustc-link-lib=static=ggml-cpu");
     }
+    // ggml-blas is built on macOS (Accelerate backend, default) and whenever the
+    // `openblas` feature is enabled (any OS). Link it exactly once for either case.
     if cfg!(target_os = "macos") || cfg!(feature = "openblas") {
         println!("cargo:rustc-link-lib=static=ggml-blas");
     }
@@ -354,10 +390,6 @@ fn main() {
         println!("cargo:rustc-link-lib=static=ggml-cuda");
     }
 
-    if cfg!(feature = "openblas") {
-        println!("cargo:rustc-link-lib=static=ggml-blas");
-    }
-
     if cfg!(feature = "intel-sycl") {
         println!("cargo:rustc-link-lib=ggml-sycl");
     }
@@ -369,8 +401,12 @@ fn main() {
             .expect("Could not find whisper.cpp version declaration"),
     );
 
-    // for whatever reason this file is generated during build and triggers cargo complaining
-    _ = std::fs::remove_file("bindings/javascript/package.json");
+    // whisper.cpp's CMakeLists.txt runs `configure_file(... package-tmpl.json ... package.json)`
+    // for standalone builds, generating `bindings/javascript/package.json` under the CMake source
+    // tree (here, the OUT_DIR copy). Clean it up so it doesn't trigger cargo's change detection.
+    // Best-effort: ignore errors when the file is absent.
+    let _ = std::fs::remove_file(whisper_root.join("bindings/javascript/package.json"));
+    let _ = std::fs::remove_file("whisper.cpp/bindings/javascript/package.json");
 }
 
 // From https://github.com/alexcrichton/cc-rs/blob/fba7feded71ee4f63cfe885673ead6d7b4f2f454/src/lib.rs#L2462
@@ -383,6 +419,28 @@ fn get_cpp_link_stdlib(target: &str) -> Option<&'static str> {
         Some("c++_shared")
     } else {
         Some("stdc++")
+    }
+}
+
+/// Resolve a Homebrew package prefix via `brew --prefix <package>`.
+///
+/// Returns `None` when `brew` is unavailable or the package is not installed, so callers can
+/// fall back gracefully instead of failing the build on non-Homebrew machines.
+#[cfg(feature = "openmp")]
+fn brew_prefix(package: &str) -> Option<PathBuf> {
+    let output = std::process::Command::new("brew")
+        .args(["--prefix", package])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let prefix = String::from_utf8(output.stdout).ok()?;
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(prefix))
     }
 }
 

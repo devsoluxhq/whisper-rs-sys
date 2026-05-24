@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Compile + run the build script (CMake build of whisper.cpp + bindgen) across
+  # the configurations we ship: Linux default, Linux OpenMP, and macOS Metal.
+  check:
+    name: cargo check (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-default
+            os: ubuntu-latest
+            features: ""
+          - name: linux-openmp
+            os: ubuntu-latest
+            features: "--features openmp"
+          - name: macos-metal
+            os: macos-latest
+            features: "--features metal"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libclang-dev
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake
+
+      # MSRV is pinned to 1.88.0 in Cargo.toml; `stable` satisfies that floor.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check
+        run: cargo check --locked ${{ matrix.features }}
+
+  # Prebuilt-bindings path (no bindgen / libclang). Also exercises the MSVC build path on Windows,
+  # where build.rs has dedicated static-CRT handling.
+  check-no-bindgen:
+    name: cargo check, prebuilt bindings (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      WHISPER_DONT_GENERATE_BINDINGS: "1"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake
+      # Windows runners ship CMake and MSVC; no extra install needed.
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check
+        run: cargo check --locked
+
+  # Detect drift between the checked-in src/bindings.rs and freshly generated bindings.
+  # Informational (continue-on-error) because bindgen output can shift across libclang versions;
+  # a red step here is a prompt to regenerate, not a hard merge blocker.
+  bindings-drift:
+    name: bindings drift (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install bindgen dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # DOCS_RS=1 makes build.rs generate bindings and return before the native CMake build,
+      # so this is fast and needs no CMake/compiler toolchain.
+      - name: Generate bindings (skip native build)
+        run: DOCS_RS=1 cargo check --locked
+
+      - name: Compare against checked-in bindings
+        run: |
+          generated=$(find target -path '*/out/bindings.rs' | head -n1)
+          if [ -z "$generated" ]; then
+            echo "::error::could not locate generated bindings.rs under target/"
+            exit 1
+          fi
+          if ! diff -u src/bindings.rs "$generated"; then
+            echo "::warning::src/bindings.rs differs from freshly generated bindings. If the diff is meaningful, regenerate and commit src/bindings.rs."
+            exit 1
+          fi
+          echo "src/bindings.rs is up to date."
