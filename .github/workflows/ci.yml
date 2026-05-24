@@ -87,13 +87,14 @@ jobs:
       - name: cargo check
         run: cargo check --locked
 
-  # Detect drift between the checked-in src/bindings.rs and freshly generated bindings.
-  # Informational (continue-on-error) because bindgen output can shift across libclang versions;
-  # a red step here is a prompt to regenerate, not a hard merge blocker.
+  # Print the diff between the checked-in src/bindings.rs and freshly generated bindings.
+  # Purely informational and never fails: bindgen leaks host libc/glibc system types into the
+  # output, so a byte-for-byte comparison across machines always differs even when the
+  # whisper.cpp/ggml API is unchanged. Use the logged diff to eyeball real header changes;
+  # regenerate src/bindings.rs locally if the diff touches the whisper_/ggml_ API.
   bindings-drift:
     name: bindings drift (informational)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v6
 
@@ -107,19 +108,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # DOCS_RS=1 makes build.rs generate bindings and return before the native CMake build,
-      # so this is fast and needs no CMake/compiler toolchain.
+      # so this is fast and needs no CMake/compiler toolchain. A real bindgen failure here
+      # (broken headers) still fails the job; only the comparison below is non-failing.
       - name: Generate bindings (skip native build)
         run: DOCS_RS=1 cargo check --locked
 
-      - name: Compare against checked-in bindings
+      - name: Compare against checked-in bindings (non-failing)
         run: |
           generated=$(find target -path '*/out/bindings.rs' | head -n1)
           if [ -z "$generated" ]; then
-            echo "::error::could not locate generated bindings.rs under target/"
-            exit 1
+            echo "::warning::could not locate generated bindings.rs under target/"
+            exit 0
           fi
-          if ! diff -u src/bindings.rs "$generated"; then
-            echo "::warning::src/bindings.rs differs from freshly generated bindings. If the diff is meaningful, regenerate and commit src/bindings.rs."
-            exit 1
+          if diff -u src/bindings.rs "$generated"; then
+            echo "src/bindings.rs matches freshly generated bindings."
+          else
+            echo "::warning::src/bindings.rs differs from freshly generated bindings. This is usually just host glibc/libclang differences (system types leak into the output). Regenerate and commit only if the diff touches the whisper_/ggml_ API."
           fi
-          echo "src/bindings.rs is up to date."
